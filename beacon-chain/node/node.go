@@ -796,6 +796,7 @@ func (b *BeaconNode) registerPOWChainService() error {
 		execution.WithBeaconNodeStatsUpdater(bs),
 		execution.WithFinalizedStateAtStartup(b.finalizedStateAtStartUp),
 		execution.WithJwtId(b.cliCtx.String(flags.JwtId.Name)),
+		execution.WithVerifierWaiter(b.verifyInitWaiter),
 	)
 	web3Service, err := execution.NewService(b.ctx, opts...)
 	if err != nil {

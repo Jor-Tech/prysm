@@ -14,6 +14,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/pkg/errors"
 	"github.com/prysmaticlabs/prysm/v5/beacon-chain/execution/types"
+	"github.com/prysmaticlabs/prysm/v5/beacon-chain/sync"
 	"github.com/prysmaticlabs/prysm/v5/beacon-chain/verification"
 	fieldparams "github.com/prysmaticlabs/prysm/v5/config/fieldparams"
 	"github.com/prysmaticlabs/prysm/v5/config/params"
@@ -29,7 +30,6 @@ import (
 	"github.com/prysmaticlabs/prysm/v5/time/slots"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
-	"k8s.io/utils/strings/slices"
 )
 
 var (
@@ -114,7 +114,7 @@ type Reconstructor interface {
 	ReconstructFullBellatrixBlockBatch(
 		ctx context.Context, blindedBlocks []interfaces.ReadOnlySignedBeaconBlock,
 	) ([]interfaces.SignedBeaconBlock, error)
-	ReconstructBlobSidecars(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock, blockRoot [32]byte) ([]blocks.VerifiedROBlob, error)
+	ReconstructBlobSidecars(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock, blockRoot [32]byte, indices [6]bool) ([]blocks.VerifiedROBlob, error)
 }
 
 // EngineCaller defines a client that can interact with an Ethereum
@@ -306,6 +306,8 @@ func (s *Service) ExchangeCapabilities(ctx context.Context) ([]string, error) {
 	result := &pb.ExchangeCapabilities{}
 	err := s.rpcClient.CallContext(ctx, &result, ExchangeCapabilities, supportedEngineEndpoints)
 
+	log.Info(result.SupportedMethods)
+
 	var unsupported []string
 	for _, s1 := range supportedEngineEndpoints {
 		supported := false
@@ -493,12 +495,13 @@ func (s *Service) HeaderByNumber(ctx context.Context, number *big.Int) (*types.H
 func (s *Service) GetBlobs(ctx context.Context, versionedHashes []common.Hash) ([]*pb.BlobAndProof, error) {
 	ctx, span := trace.StartSpan(ctx, "powchain.engine-api-client.GetBlobs")
 	defer span.End()
-	s.capabilitiesLock.RLock()
-	if !slices.Contains(s.capabilities, GetBlobsV1) {
-		s.capabilitiesLock.RUnlock()
-		return nil, nil
-	}
-	s.capabilitiesLock.RUnlock()
+	// TODO: Engine get capabilities is broken
+	//s.capabilitiesLock.RLock()
+	//if !slices.Contains(s.capabilities, GetBlobsV1) {
+	//	s.capabilitiesLock.RUnlock()
+	//	return nil, nil
+	//}
+	//s.capabilitiesLock.RUnlock()
 
 	result := make([]*pb.BlobAndProof, len(versionedHashes))
 	err := s.rpcClient.CallContext(ctx, &result, GetBlobsV1, versionedHashes)
@@ -536,17 +539,25 @@ func (s *Service) ReconstructFullBellatrixBlockBatch(
 // ReconstructBlobSidecars reconstructs the blob sidecars for a given beacon block.
 // It retrieves the KZG commitments from the block body, fetches the associated blobs and proofs,
 // and constructs the corresponding verified read-only blob sidecars.
-func (s *Service) ReconstructBlobSidecars(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock, blockRoot [32]byte) ([]blocks.VerifiedROBlob, error) {
+func (s *Service) ReconstructBlobSidecars(ctx context.Context, block interfaces.ReadOnlySignedBeaconBlock, blockRoot [32]byte, exists [6]bool) ([]blocks.VerifiedROBlob, error) {
 	blockBody := block.Block().Body()
-
-	// Get KZG commitments from the block body
 	kzgCommitments, err := blockBody.BlobKzgCommitments()
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get blob KZG commitments")
 	}
 
-	// Initialize KZG hashes and retrieve blobs
-	kzgHashes := make([]common.Hash, len(kzgCommitments))
+	// Collect KZG hashes for non-existing blobs
+	var kzgHashes []common.Hash
+	for i, commitment := range kzgCommitments {
+		if !exists[i] {
+			kzgHashes = append(kzgHashes, primitives.ConvertKzgCommitmentToVersionedHash(commitment))
+		}
+	}
+	if len(kzgHashes) == 0 {
+		return nil, nil
+	}
+
+	// Fetch blobs from EL
 	blobs, err := s.GetBlobs(ctx, kzgHashes)
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get blobs")
@@ -555,51 +566,58 @@ func (s *Service) ReconstructBlobSidecars(ctx context.Context, block interfaces.
 		return nil, nil
 	}
 
-	// Get the block header and its hash tree root
 	header, err := block.Header()
 	if err != nil {
 		return nil, errors.Wrap(err, "could not get header")
 	}
-	// Loop through the blobs and reconstruct blob sidecars
-	verifiedBlobs := make([]blocks.VerifiedROBlob, 0, len(blobs))
-	for index, blob := range blobs {
+
+	// Reconstruct verify blob sidecars
+	var verifiedBlobs []blocks.VerifiedROBlob
+	for i, blobIndex := 0, 0; i < len(kzgCommitments); i++ {
+		if exists[i] {
+			sync.BlobExistedFromDbCount.Inc()
+			continue
+		}
+
+		blob := blobs[blobIndex]
+		blobIndex++
 		if blob == nil {
 			continue
 		}
 
-		// Get the Merkle proof for the KZG commitment
-		proof, err := blocks.MerkleProofKZGCommitment(blockBody, index)
+		proof, err := blocks.MerkleProofKZGCommitment(blockBody, i)
 		if err != nil {
-			log.WithError(err).Error("could not get Merkle proof for KZG commitment")
+			log.WithError(err).WithField("index", i).Error("failed to get Merkle proof for KZG commitment")
 			continue
 		}
-
-		// Create the BlobSidecar object
 		sidecar := &ethpb.BlobSidecar{
-			Index:                    uint64(index),
+			Index:                    uint64(i),
 			Blob:                     blob.Blob,
-			KzgCommitment:            kzgCommitments[index],
+			KzgCommitment:            kzgCommitments[i],
 			KzgProof:                 blob.KzgProof,
 			SignedBlockHeader:        header,
 			CommitmentInclusionProof: proof,
 		}
 
-		// Create a read-only blob with the header root
 		roBlob, err := blocks.NewROBlobWithRoot(sidecar, blockRoot)
 		if err != nil {
-			log.WithError(err).Error("could not create RO blob with root")
+			log.WithError(err).WithField("index", i).Error("failed to create RO blob with root")
 			continue
 		}
+
+		// Verify the sidecar KZG proof
 		v := s.blobVerifier(roBlob, verification.ELMemPoolRequirements)
 		if err := v.SidecarKzgProofVerified(); err != nil {
-			log.WithError(err).Error("could not verify KZG proof for sidecar")
+			log.WithError(err).WithField("index", i).Error("failed to verify KZG proof for sidecar")
 			continue
 		}
+
 		verifiedBlob, err := v.VerifiedROBlob()
 		if err != nil {
-			log.WithError(err).Error("could not verify RO blob")
+			log.WithError(err).WithField("index", i).Error("failed to verify RO blob")
 			continue
 		}
+
 		verifiedBlobs = append(verifiedBlobs, verifiedBlob)
 	}
 

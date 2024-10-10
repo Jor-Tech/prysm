@@ -72,31 +72,44 @@ func (s *Service) attemptBlobSaveAndBroadcast(ctx context.Context, block interfa
 		return
 	}
 
-	// Reconstruct blob sidecars from the EL
-	blobSidecars, err := s.cfg.executionReconstructor.ReconstructBlobSidecars(ctx, block, blockRoot)
-	if err != nil {
-		log.WithError(err).Error("Failed to reconstruct blob sidecars")
-		return
-	}
-	if blobSidecars == nil {
-		return
-	}
-
-	// Get indices of already existing blobs in the database to avoid duplicates
 	indices, err := s.cfg.blobStorage.Indices(blockRoot)
 	if err != nil {
 		log.WithError(err).Error("Failed to retrieve indices for block")
 		return
 	}
 
-	// Iterate through the reconstructed sidecars, save them to the chain, and broadcast them to peers
-	for i, sidecar := range blobSidecars {
-		if indices[i] {
+	// Reconstruct blob sidecars from the EL
+	blobSidecars, err := s.cfg.executionReconstructor.ReconstructBlobSidecars(ctx, block, blockRoot, indices)
+	if err != nil {
+		log.WithError(err).Error("Failed to reconstruct blob sidecars")
+		return
+	}
+	if len(blobSidecars) == 0 {
+		return
+	}
+
+	// Refresh indices as new blobs may have been added to the db
+	indices, err = s.cfg.blobStorage.Indices(blockRoot)
+	if err != nil {
+		log.WithError(err).Error("Failed to retrieve indices for block")
+		return
+	}
+
+	// Broadcast blob sidecars faster than processing them
+	for _, sidecar := range blobSidecars {
+		if indices[sidecar.Index] {
 			continue // Skip if the blob already exists in the database
 		}
 
 		if err := s.cfg.p2p.BroadcastBlob(ctx, sidecar.Index, sidecar.BlobSidecar); err != nil {
 			log.WithFields(blobFields(sidecar.ROBlob)).WithError(err).Error("Failed to broadcast blob sidecar")
+		}
+	}
+
+	for _, sidecar := range blobSidecars {
+		if indices[sidecar.Index] {
+			BlobExistedFromDbCount.Inc()
+			continue
 		}
 
 		if err := s.cfg.chain.ReceiveBlob(ctx, sidecar); err != nil {
@@ -107,7 +120,7 @@ func (s *Service) attemptBlobSaveAndBroadcast(ctx context.Context, block interfa
 
 		fields := blobFields(sidecar.ROBlob)
 		fields["sinceSlotStartTime"] = s.cfg.clock.Now().Sub(startTime)
-		log.WithFields(fields).Debug("Successfully received and processed blob sidecar from EL")
+		log.WithFields(fields).Debug("Processed blob sidecar from EL")
 	}
 }
 

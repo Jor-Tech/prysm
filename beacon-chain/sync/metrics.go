@@ -177,6 +177,13 @@ var (
 			Help: "Count the number of times blobs have been recovered from the execution layer.",
 		},
 	)
+
+	BlobExistedFromDbCount = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "blob_existed_from_db_count",
+			Help: "Count the number of times blobs have been found in the database.",
+		},
+	)
 )
 
 func (s *Service) updateMetrics() {
