@@ -59,7 +59,7 @@ func InitializeFromProtoUnsafeEpbs(st *ethpb.BeaconStateEPBS) (*BeaconState, err
 		earliestExitEpoch:             st.EarliestExitEpoch,
 		consolidationBalanceToConsume: st.ConsolidationBalanceToConsume,
 		earliestConsolidationEpoch:    st.EarliestConsolidationEpoch,
-		pendingBalanceDeposits:        st.PendingBalanceDeposits,
+		pendingDeposits:               st.PendingDeposits,
 		pendingPartialWithdrawals:     st.PendingPartialWithdrawals,
 		pendingConsolidations:         st.PendingConsolidations,
 
@@ -129,7 +129,7 @@ func InitializeFromProtoUnsafeEpbs(st *ethpb.BeaconStateEPBS) (*BeaconState, err
 	b.sharedFieldReferences[types.PreviousEpochParticipationBits] = stateutil.NewRef(1)
 	b.sharedFieldReferences[types.CurrentEpochParticipationBits] = stateutil.NewRef(1)
 	b.sharedFieldReferences[types.HistoricalSummaries] = stateutil.NewRef(1)
-	b.sharedFieldReferences[types.PendingBalanceDeposits] = stateutil.NewRef(1)
+	b.sharedFieldReferences[types.PendingDeposits] = stateutil.NewRef(1)
 	b.sharedFieldReferences[types.PendingPartialWithdrawals] = stateutil.NewRef(1)
 	b.sharedFieldReferences[types.PendingConsolidations] = stateutil.NewRef(1)
 	if !features.Get().EnableExperimentalState {
