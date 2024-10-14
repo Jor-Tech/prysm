@@ -3,6 +3,7 @@ package initialsync
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
@@ -371,12 +372,12 @@ func (f *blocksFetcher) calculateHeadAndTargetEpochs() (headEpoch, targetEpoch p
 	return headEpoch, targetEpoch, peers
 }
 
-// custodyAllNeededColumns filter `inputPeers` that custody all columns in `columns`.
-func (f *blocksFetcher) custodyAllNeededColumns(inputPeers map[peer.ID]bool, columns map[uint64]bool) (map[peer.ID]bool, error) {
-	outputPeers := make(map[peer.ID]bool, len(inputPeers))
+// custodyColumnFromPeer compute all costody columns indexed by peer.
+func (f *blocksFetcher) custodyDataColumnsFromPeer(peers map[peer.ID]bool) (map[peer.ID]map[uint64]bool, error) {
+	peerCount := len(peers)
 
-loop:
-	for peer := range inputPeers {
+	custodyDataColumnsByPeer := make(map[peer.ID]map[uint64]bool, peerCount)
+	for peer := range peers {
 		// Get the node ID from the peer ID.
 		nodeID, err := p2p.ConvertPeerIDToNodeID(peer)
 		if err != nil {
@@ -387,59 +388,76 @@ loop:
 		custodyCount := f.p2p.DataColumnsCustodyCountFromRemotePeer(peer)
 
 		// Get the custody columns from the peer.
-		remoteCustodyColumns, err := peerdas.CustodyColumns(nodeID, custodyCount)
+		custodyDataColumns, err := peerdas.CustodyColumns(nodeID, custodyCount)
 		if err != nil {
 			return nil, errors.Wrap(err, "custody columns")
 		}
 
-		for column := range columns {
-			if !remoteCustodyColumns[column] {
-				continue loop
-			}
-		}
-
-		outputPeers[peer] = true
+		custodyDataColumnsByPeer[peer] = custodyDataColumns
 	}
 
-	return outputPeers, nil
+	return custodyDataColumnsByPeer, nil
 }
 
-// peersWithSlotAndDataColumns returns a list of peers that should custody all needed data columns for the given slot.
-func (f *blocksFetcher) peersWithSlotAndDataColumns(
+// uint64MapToSortedSlice produces a sorted uint64 slice from a map.
+func uint64MapToSortedSlice(input map[uint64]bool) []uint64 {
+	output := make([]uint64, 0, len(input))
+	for idx := range input {
+		output = append(output, idx)
+	}
+
+	slices.Sort[[]uint64](output)
+	return output
+}
+
+// admissiblePeersFromDataColumn returns a map of peers that:
+// - custody at least one column listed in `neededDataColumns`,
+// - are synced to `targetSlot`, and
+// - have enough bandwidth to serve data columns corresponding to `count` blocks.
+// It returns a map, where the key of the map is the peer, the value is the custody columns of the peer.
+func (f *blocksFetcher) admissiblePeersFromDataColumn(
 	ctx context.Context,
 	peers []peer.ID,
 	targetSlot primitives.Slot,
-	dataColumns map[uint64]bool,
+	neededDataColumns map[uint64]bool,
 	count uint64,
-) ([]peer.ID, []string, error) {
-	peersCount := len(peers)
+) (map[peer.ID]map[uint64]bool, []string, error) {
+	peerCount := len(peers)
+	neededDataColumnsCount := uint64(len(neededDataColumns))
 
-	// Filter peers based on the percentage of peers to be used in a request.
-	peers = f.filterPeers(ctx, peers, peersPercentagePerRequestDataColumns)
+	// Create description slice for non admissible peers.
+	descriptions := make([]string, 0, peerCount)
 
-	// // Filter peers on bandwidth.
-	peers = f.hasSufficientBandwidth(peers, count)
+	// Get pretty needed data columns for logs.
+	var neededDataColumnsLog interface{} = "all"
+	numberOfColumns := params.BeaconConfig().NumberOfColumns
 
-	// Select peers which custody ALL wanted columns.
-	// Basically, it is very unlikely that a non-supernode peer will have custody of all columns.
-	// TODO: Modify to retrieve data columns from all possible peers.
-	// TODO: If a peer does respond some of the request columns, do not re-request responded columns.
+	if neededDataColumnsCount < numberOfColumns {
+		neededDataColumnsLog = uint64MapToSortedSlice(neededDataColumns)
+	}
+
+	// Filter peers on bandwidth.
+	peersWithSufficientBandwidth := f.hasSufficientBandwidth(peers, count)
+
+	// Convert peers with sufficient bandwidth to a map.
+	peerWithSufficientBandwidthMap := make(map[peer.ID]bool, len(peersWithSufficientBandwidth))
+	for _, peer := range peersWithSufficientBandwidth {
+		peerWithSufficientBandwidthMap[peer] = true
+	}
+
+	for _, peer := range peers {
+		if !peerWithSufficientBandwidthMap[peer] {
+			description := fmt.Sprintf("peer %s: does not have sufficient bandwidth", peer)
+			descriptions = append(descriptions, description)
+		}
+	}
 
 	// Compute the target epoch from the target slot.
 	targetEpoch := slots.ToEpoch(targetSlot)
 
-	peersWithAdmissibleHeadEpoch := make(map[peer.ID]bool, peersCount)
-	descriptions := make([]string, 0, peersCount)
-
-	// Filter out peers with head epoch lower than our target epoch.
-	// Technically, we should be able to use the head slot from the peer.
-	// However, our vision of the head slot of the peer is updated twice per epoch
-	// via P2P messages. So it is likely that we think the peer is lagging behind
-	// while it is actually not.
-	// ==> We use the head epoch as a proxy instead.
-	// However, if the peer is actually lagging for a few slots,
-	// we may requests some data columns it doesn't have yet.
-	for _, peer := range peers {
+	// Filter peers with head epoch lower than our target epoch.
+	peersWithAdmissibleHeadEpoch := make(map[peer.ID]bool, peerCount)
+	for _, peer := range peersWithSufficientBandwidth {
 		peerChainState, err := f.p2p.Peers().ChainState(peer)
 
 		if err != nil {
@@ -457,7 +475,7 @@ func (f *blocksFetcher) peersWithSlotAndDataColumns(
 		peerHeadEpoch := slots.ToEpoch(peerChainState.HeadSlot)
 
 		if peerHeadEpoch < targetEpoch {
-			description := fmt.Sprintf("peer %s: head epoch %d < target epoch %d", peer, peerHeadEpoch, targetEpoch)
+			description := fmt.Sprintf("peer %s: peer head epoch %d < our target epoch %d", peer, peerHeadEpoch, targetEpoch)
 			descriptions = append(descriptions, description)
 			continue
 		}
@@ -465,29 +483,42 @@ func (f *blocksFetcher) peersWithSlotAndDataColumns(
 		peersWithAdmissibleHeadEpoch[peer] = true
 	}
 
-	// Filter out peers that do not have all the data columns needed.
-	finalPeers, err := f.custodyAllNeededColumns(peersWithAdmissibleHeadEpoch, dataColumns)
+	// Compute custody columns for each peer.
+	dataColumnsByPeerWithAdmissibleHeadEpoch, err := f.custodyDataColumnsFromPeer(peersWithAdmissibleHeadEpoch)
 	if err != nil {
-		return nil, nil, errors.Wrap(err, "custody all needed columns")
+		return nil, nil, errors.Wrap(err, "custody columns from peer")
 	}
 
-	for peer := range peersWithAdmissibleHeadEpoch {
-		if _, ok := finalPeers[peer]; !ok {
-			description := fmt.Sprintf("peer %s: does not custody all needed columns", peer)
-			descriptions = append(descriptions, description)
+	// Filter peers which custody at least one needed column.
+	admissiblePeers := make(map[peer.ID]map[uint64]bool, len(dataColumnsByPeerWithAdmissibleHeadEpoch))
+
+outerLoop:
+	for peer, peerCustodyDataColumns := range dataColumnsByPeerWithAdmissibleHeadEpoch {
+		for neededDataColumn := range neededDataColumns {
+			if peerCustodyDataColumns[neededDataColumn] {
+				if _, ok := admissiblePeers[peer]; !ok {
+					admissiblePeers[peer] = map[uint64]bool{neededDataColumn: true}
+					continue
+				}
+				admissiblePeers[peer][neededDataColumn] = true
+				continue outerLoop
+			}
 		}
+
+		peerCustodyColumnsCount := uint64(len(peerCustodyDataColumns))
+		var peerCustodyColumnsLog interface{} = "all"
+
+		if peerCustodyColumnsCount < numberOfColumns {
+			peerCustodyColumnsLog = uint64MapToSortedSlice(peerCustodyDataColumns)
+		}
+
+		description := fmt.Sprintf(
+			"peer %s: does not custody any needed column, custody columns: %v, needed columns: %v",
+			peer, peerCustodyColumnsLog, neededDataColumnsLog,
+		)
+
+		descriptions = append(descriptions, description)
 	}
 
-	// Convert the map to a slice.
-	finalPeersSlice := make([]peer.ID, 0, len(finalPeers))
-	for peer := range finalPeers {
-		finalPeersSlice = append(finalPeersSlice, peer)
-	}
-
-	// Shuffle the peers.
-	f.rand.Shuffle(len(finalPeersSlice), func(i, j int) {
-		finalPeersSlice[i], finalPeersSlice[j] = finalPeersSlice[j], finalPeersSlice[i]
-	})
-
-	return finalPeersSlice, descriptions, nil
+	return admissiblePeers, descriptions, nil
 }

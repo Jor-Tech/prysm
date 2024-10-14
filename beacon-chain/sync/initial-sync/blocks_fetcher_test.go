@@ -1707,7 +1707,7 @@ func TestBuildBwbSlices(t *testing.T) {
 				blockRoot := bwb.Block.Root()
 				missingColumnsByRoot[blockRoot] = missingColumns
 			}
-			bwbSlices, err := buildBwbSlices(bwbs, missingColumnsByRoot)
+			bwbSlices, err := buildBwbSlices(&sync.RWMutex{}, bwbs, missingColumnsByRoot)
 			require.NoError(t, err)
 			require.Equal(t, true, areBwbSlicesEqual(tt.bwbSlices, bwbSlices))
 		})
@@ -1841,21 +1841,8 @@ func TestFetchDataColumnsFromPeers(t *testing.T) {
 			},
 			peersParams: []peerParams{
 				{
-					// This peer custodies all the columns we need but
-					// will never respond any column.
-					csc: 128,
-					toRespond: map[string][][]responseParams{
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 33,
-							Count:     4,
-							Columns:   []uint64{70, 102},
-						}).String(): {{}},
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 37,
-							Count:     1,
-							Columns:   []uint64{6, 70},
-						}).String(): {{}},
-					},
+					csc:       0,
+					toRespond: map[string][][]responseParams{},
 				},
 				{
 					csc: 128,
@@ -1887,26 +1874,33 @@ func TestFetchDataColumnsFromPeers(t *testing.T) {
 					},
 				},
 				{
-					// This peer custodies all the columns we need but
-					// will never respond any column.
 					csc: 128,
 					toRespond: map[string][][]responseParams{
 						(&ethpb.DataColumnSidecarsByRangeRequest{
 							StartSlot: 33,
 							Count:     4,
 							Columns:   []uint64{70, 102},
-						}).String(): {{}},
+						}).String(): {
+							{
+								{slot: 33, columnIndex: 70},
+								{slot: 33, columnIndex: 102},
+								{slot: 34, columnIndex: 70},
+								{slot: 34, columnIndex: 102},
+								{slot: 36, columnIndex: 70},
+								{slot: 36, columnIndex: 102},
+							},
+						},
 						(&ethpb.DataColumnSidecarsByRangeRequest{
 							StartSlot: 37,
 							Count:     1,
 							Columns:   []uint64{6, 70},
-						}).String(): {{}},
+						}).String(): {
+							{
+								{slot: 37, columnIndex: 6},
+								{slot: 37, columnIndex: 70},
+							},
+						},
 					},
-				},
-				{
-					// This peer should not be requested.
-					csc:       2,
-					toRespond: map[string][][]responseParams{},
 				},
 			},
 			addedRODataColumns: [][]int{
@@ -1957,38 +1951,6 @@ func TestFetchDataColumnsFromPeers(t *testing.T) {
 						(&ethpb.DataColumnSidecarsByRangeRequest{
 							StartSlot: 33,
 							Count:     4,
-							Columns:   []uint64{70},
-						}).String(): {
-							{
-								{slot: 33, columnIndex: 70},
-								{slot: 34, columnIndex: 70},
-								{slot: 36, columnIndex: 70},
-							},
-						},
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 33,
-							Count:     4,
-							Columns:   []uint64{102},
-						}).String(): {{}},
-					},
-				},
-				{
-					csc: 128,
-					toRespond: map[string][][]responseParams{
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 33,
-							Count:     4,
-							Columns:   []uint64{70, 102},
-						}).String(): {
-							{
-								{slot: 33, columnIndex: 102},
-								{slot: 34, columnIndex: 102},
-								{slot: 36, columnIndex: 102},
-							},
-						},
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 33,
-							Count:     4,
 							Columns:   []uint64{102},
 						}).String(): {
 							{
@@ -1997,11 +1959,6 @@ func TestFetchDataColumnsFromPeers(t *testing.T) {
 								{slot: 36, columnIndex: 102},
 							},
 						},
-						(&ethpb.DataColumnSidecarsByRangeRequest{
-							StartSlot: 33,
-							Count:     4,
-							Columns:   []uint64{70},
-						}).String(): {{}},
 					},
 				},
 			},
